@@ -1,7 +1,8 @@
 const cron = require("node-cron");
 const request = require("request");
 const cheerio = require("cheerio");
-const gSendConfig = require("./gSendOptions.json");
+const configs = require("./configs/general.json");
+const gSendConfig = require("./configs/gSendOptions.json");
 const gsend = require("gmail-send")(gSendConfig);
 
 let lastRequestTime = Date.now();
@@ -41,11 +42,10 @@ function fetchLocationStation(body) {
 }
 
 function analyseResult(error, response, body) {
-    let priceTreshold = 1600;
     if (!error && response.statusCode == 200) {
         let price = fetchPriceValue(body);
         console.log("current price detected: " + price + " at " + lastRequestTime);
-        if (price >= priceTreshold) {
+        if (price >= configs.priceTresholdValue) {
             let system = fetchLocationSystem(body);
             let station = fetchLocationStation(body);
             let message = price + " " + station + " " + system;
@@ -58,7 +58,7 @@ function fetchData() {
     lastRequestTime = Date.now();
     // the url for low temperature diamonds on elite dangerous
     let options = {
-        url: 'https://eddb.io/commodity/276'
+        url: "https://eddb.io/commodity/" + configs.commodityCode
     };
 
     request(options, analyseResult);
@@ -74,7 +74,7 @@ function getTimeAnalysis() {
 }
 
 function checkMarketPrices() {
-    let requestTimeTreshold = generateNumberBetween(60,601); // 1 minute, 10 minutes, in seconds.
+    let requestTimeTreshold = generateNumberBetween(configs.timeLowerTreshold, configs.timeUpperTreshold);
     let timeResult = getTimeAnalysis();
     if (timeResult > requestTimeTreshold) {
         fetchData();

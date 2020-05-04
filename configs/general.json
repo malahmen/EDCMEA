@@ -1,0 +1,6 @@
+{
+    "priceTresholdValue": 1600,
+    "commodityCode": 276,
+    "timeLowerTreshold": 60,
+    "timeUpperTreshold": 601
+}
