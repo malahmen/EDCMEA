@@ -1,0 +1,28 @@
+name: ci
+
+# Every push and pull request. The suite needs no network and sends no mail:
+# it runs against a fake Ardent (a local HTTP server) and a fake pop (a script
+# that records what it was given).
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"     # the oldest it supports; the code is checked against it
+      - name: compile
+        run: python -m compileall -q edcmea edcmea.py
+      - name: shellcheck
+        run: shellcheck -S warning edcmea.sh
+      - name: tests
+        run: python -m unittest discover -s tests -v
