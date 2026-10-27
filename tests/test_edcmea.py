@@ -491,6 +491,28 @@ class Resilience(Base):
                 self.assertIsInstance(ardent.commodities(), list)
                 self.assertEqual(len(self.fake.requests), 2)
 
+    def test_rows_without_coordinates_are_skipped_not_fatal(self):
+        self.fake.imports[LTD][1].update(systemX=None)
+        rule = rules.validate({"name": "t", "commodity": LTD, "min_price": 600000, "near": "Sol", "max_ly": 1000})
+        names = [r["stationName"] for r in rules.matches(rule, (0.0, 0.0, 0.0))]
+        self.assertNotIn("Arc City", names)
+        self.assertIn("Small Port", names)
+
+    def test_a_state_file_that_is_not_an_object_is_refused_by_name(self):
+        self.ready()
+        for text in ("[]", '"x"', '{"ltd": 5}'):
+            with self.subTest(text=text):
+                os.makedirs(config.state_dir(), exist_ok=True)
+                with open(config.state_file(), "w") as fh:
+                    fh.write(text)
+                self.fake.requests.clear()
+                rc, out = self.cli("check")
+                self.assertEqual(rc, 2, out)
+                self.assertIn(config.state_file(), out)
+                self.assertEqual(self.pops(), [])
+                with open(config.state_file()) as fh:
+                    self.assertEqual(fh.read(), text)        # left as it was, not reset
+
 
 class Deadline(Base):
     """Kamino 179 (2) and the urlopen-timeout survivor."""
@@ -511,6 +533,14 @@ class Deadline(Base):
 class Survivors(Base):
     """Kamino 179 (4): the mutants the first review saw survive."""
 
+    def test_state_is_written_atomically(self):
+        config.save_state({"a": {"price": 1}})
+        with mock.patch.object(config.os, "replace", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            config.save_state({"b": {"price": 2}})
+        self.assertEqual(config.load_state(), {"a": {"price": 1}})
+        self.assertEqual([f for f in os.listdir(config.state_dir()) if f.endswith(".tmp")], [])
+
     def test_a_5xx_is_retried_until_it_answers(self):
         self.fake.script = [(503, {}), (502, {})]
         self.assertIsInstance(ardent.commodities(), list)
@@ -522,9 +552,73 @@ class Survivors(Base):
             ardent.commodities()
         self.assertEqual(len(self.fake.requests), 1)
 
+    def test_a_corrupt_state_is_an_error_never_a_reset(self):
+        self.ready()
+        self.cli("check")
+        for text in ('{"ltd": ', b"\xff\xfe\x00garbage"):
+            with self.subTest(text=text):
+                with open(config.state_file(), "wb") as fh:
+                    fh.write(text if isinstance(text, bytes) else text.encode())
+                self.fake.requests.clear()
+                rc, out = self.cli("check")
+                self.assertEqual(rc, 2, out)
+                self.assertIn(config.state_file(), out)          # Kamino 197: named
+                self.assertEqual(len(self.pops()), 1)
+                self.assertEqual(self.fake.requests, [])
+
+    def test_pop_reads_nothing_from_our_stdin(self):
+        self.ready()
+        r, w = os.pipe()
+        saved = os.dup(0)
+        try:
+            os.dup2(r, 0)
+            notify.send("s", "b", "cmdr@example.com")
+        finally:
+            os.dup2(saved, 0)
+            for fd in (saved, r, w):
+                os.close(fd)
+        self.assertTrue(self.pops()[0]["stdin_null"])
+
+    def test_a_hung_pop_is_given_up_on(self):
+        self.ready()
+        with mock.patch.dict(os.environ, {"STUB_POP_SLEEP": "5"}), \
+                mock.patch.object(notify, "POP_TIMEOUT", 0.5):
+            finished, result = in_thread(lambda: notify.send("s", "b", "cmdr@example.com"), seconds=4)
+        self.assertTrue(finished, "pop was waited for past its timeout")
+        self.assertIsInstance(result, notify.NotifyError)
+        self.assertIn("did not finish", str(result))
+
+    def test_pop_env_wins_over_the_environment(self):
+        self.ready()
+        with mock.patch.dict(os.environ, {"POP_FROM": "env@example.com"}):
+            notify.send("s", "b", "cmdr@example.com")
+        self.assertEqual(self.pops()[0]["env"]["POP_FROM"], "alerts@example.com")
+
 
 class Edges(Base):
     """Kamino 197."""
+
+    def test_a_pop_env_of_another_user_is_refused(self):
+        self.ready()
+        with mock.patch.object(os, "getuid", return_value=os.getuid() + 1), \
+                self.assertRaisesRegex(ValueError, "belongs to another user"):
+            config.load_pop_env()
+
+    def test_pop_env_values_keep_their_spaces(self):
+        config.write_private(config.pop_env_file(), "POP_SMTP_PASSWORD=  pw with spaces \nPOP_FROM=a@b.c\r\n")
+        self.assertEqual(config.load_pop_env(), {"POP_SMTP_PASSWORD": "  pw with spaces ", "POP_FROM": "a@b.c"})
+
+    def test_nan_and_inf_are_not_numbers_here(self):
+        for key in ("max_ly", "max_age_days", "max_arrival_ls"):
+            for bad in ("nan", "inf", "-inf"):
+                rule = {"name": "x", "commodity": LTD, "min_price": 1, key: bad}
+                if key == "max_ly":
+                    rule["near"] = "Sol"
+                with self.subTest(key=key, bad=bad), self.assertRaisesRegex(ValueError, key):
+                    rules.validate(rule)
+        rc, out = self.cli("rules", "add", "ltd", LTD, "1", "--near", "Sol", "--max-ly", "nan")
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(self.cli("set", "cooldown_hours", "nan")[0], 2)
 
     def test_a_429_is_retried_after_retry_after(self):
         waits = []

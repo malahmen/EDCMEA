@@ -10,7 +10,9 @@ them). Every file is written whole to a temporary file and renamed, so a run
 killed half-way never leaves a truncated config or state behind.
 """
 import json
+import math
 import os
+import stat
 import tempfile
 
 SETTINGS = {
@@ -22,6 +24,9 @@ SETTINGS = {
     "cooldown_hours": 24.0,
     # how many of the best matches an alert lists
     "matches_in_alert": 5,
+    # a run stops asking Ardent after this long (the rules left are reported
+    # as failed), so a slow peer cannot hold the lock past the next run
+    "run_deadline_minutes": 4.0,
 }
 
 # The pop settings EDCMEA passes on (pop reads them from its environment, and
@@ -77,11 +82,16 @@ def write_private(path: str, text: str) -> None:
 def _read_json(path: str, default):
     try:
         with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
+            data = json.load(fh)
     except FileNotFoundError:
         return default
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:            # not JSON, or not UTF-8 at all
         raise ValueError(f"{path} is not valid JSON ({exc}) - fix it or remove it") from exc
+    if not isinstance(data, type(default)):
+        raise ValueError(f"{path} holds a {type(data).__name__}, not a JSON "
+                         f"{'object' if isinstance(default, dict) else type(default).__name__}"
+                         " - fix it or remove it")
+    return data
 
 
 def load() -> dict:
@@ -108,6 +118,8 @@ def set_setting(cfg: dict, key: str, value: str) -> None:
             typed = int(value)
         elif isinstance(default, float):
             typed = float(value)
+            if not math.isfinite(typed):
+                raise ValueError(value)
         else:
             typed = value
     except ValueError as exc:
@@ -120,7 +132,14 @@ def set_setting(cfg: dict, key: str, value: str) -> None:
 
 
 def load_state() -> dict:
-    return _read_json(state_file(), {})
+    """{rule name: {...last alert...}}. A state file that cannot be read is an
+    error naming it, never an empty state: that would re-mail every alert."""
+    path = state_file()
+    state = _read_json(path, {})
+    for name, last in state.items():
+        if not isinstance(last, dict):
+            raise ValueError(f"{path}: the entry for '{name}' is not a JSON object - fix it or remove it")
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -128,17 +147,30 @@ def save_state(state: dict) -> None:
 
 
 def load_pop_env() -> dict:
-    """pop.env as a dict (KEY=value lines; # comments and blanks ignored)."""
+    """pop.env as a dict (KEY=value lines; # comments and blanks ignored).
+
+    EDCMEA writes it 0600; one made by hand may not be. A file others can read,
+    or someone else's, is refused (ValueError naming it): it holds a password.
+    A value is everything after the first '=' up to the line break - spaces
+    included, a password may end in one."""
+    path = pop_env_file()
     env = {}
     try:
-        with open(pop_env_file(), encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
+            info = os.fstat(fh.fileno())      # the file opened, not the name
+            if info.st_uid != os.getuid():
+                raise ValueError(f"{path} belongs to another user (uid {info.st_uid}) - "
+                                 "it is not used; recreate it with: edcmea pop-env")
+            if stat.S_IMODE(info.st_mode) & 0o077:
+                raise ValueError(f"{path} can be read by others ({stat.S_IMODE(info.st_mode):04o}) - "
+                                 f"it is not used; chmod 600 {path}")
             for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
+                line = line.rstrip("\r\n")
+                if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
                     continue
                 key, value = line.split("=", 1)
-                if key in POP_KEYS:
-                    env[key] = value
+                if key.strip() in POP_KEYS:
+                    env[key.strip()] = value
     except FileNotFoundError:
         pass
     return env

@@ -45,8 +45,10 @@ def validate(rule: dict) -> dict:
     for key in ("max_age_days", "max_ly", "max_arrival_ls"):
         if rule.get(key) not in (None, ""):
             value = float(rule[key])
-            if value <= 0:
-                raise ValueError(f"{key} must be above 0")
+            # nan compares false with everything: `distance > nan` never holds,
+            # so --max-ly nan would match the whole galaxy.
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{key} must be a number above 0, got '{rule[key]}'")
             out[key] = value
     if rule.get("pad") not in (None, ""):
         pad = str(rule["pad"]).upper()
@@ -90,7 +92,10 @@ def matches(rule: dict, origin=None) -> list:
         if "max_arrival_ls" in rule and float(row.get("distanceToArrival") or 0) > rule["max_arrival_ls"]:
             continue
         if origin is not None:
-            here = (float(row["systemX"]), float(row["systemY"]), float(row["systemZ"]))
+            try:
+                here = (float(row["systemX"]), float(row["systemY"]), float(row["systemZ"]))
+            except (KeyError, TypeError, ValueError):
+                continue                # no coordinates: its distance is unknown
             row = dict(row, distance_ly=distance(origin, here))
             if row["distance_ly"] > rule["max_ly"]:
                 continue
