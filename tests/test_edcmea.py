@@ -7,6 +7,8 @@ import contextlib
 import io
 import json
 import os
+import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -50,6 +52,10 @@ class FakeArdent:
         self.down = False
         self.server_filters = True     # False: Ardent stops honouring its filters
         self.requests = []
+        # What the next requests get instead of an answer, one each:
+        # (code, headers) an HTTP error; "truncate" the first bytes of a
+        # longer body (they parse: "[]"), then the connection closes; "drop" the connection closes with no answer.
+        self.script = []
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -57,6 +63,20 @@ class FakeArdent:
                 url = urlparse(self.path)
                 q = {k: v[0] for k, v in parse_qs(url.query).items()}
                 fake.requests.append((url.path, q))
+                if fake.script:
+                    action = fake.script.pop(0)
+                    if action == "drop":
+                        self.close_connection = True
+                        return None
+                    if action == "truncate":
+                        self.send_response(200)
+                        self.send_header("Content-Length", "1000")
+                        self.end_headers()
+                        self.wfile.write(b"[]")    # valid JSON, yet only part of the answer
+                        self.close_connection = True
+                        return None
+                    code, headers = action
+                    return self.reply(code, {"error": "scripted"}, headers)
                 if fake.down:
                     return self.reply(503, {"error": "down"})
                 parts = url.path.strip("/").split("/")
@@ -78,9 +98,11 @@ class FakeArdent:
                     return self.reply(200, rows)
                 return self.reply(404, {"error": "no route"})
 
-            def reply(self, code, data):
+            def reply(self, code, data, headers=None):
                 body = json.dumps(data).encode()
                 self.send_response(code)
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -94,12 +116,70 @@ class FakeArdent:
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v2"
 
 
+class RawPeer:
+    """A peer that is not an HTTP server: "silent" accepts and never answers;
+    "drip" sends headers for a long body, then a byte every 50 ms."""
+
+    def __init__(self, mode):
+        self.mode, self.stop = mode, threading.Event()
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.sock.settimeout(0.1)
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}/v2"
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        conns = []
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                continue
+            conns.append(conn)
+            if self.mode == "drip":
+                threading.Thread(target=self.drip, args=(conn,), daemon=True).start()
+        for conn in conns:
+            conn.close()
+        self.sock.close()
+
+    def drip(self, conn):
+        try:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n[")
+            while not self.stop.wait(0.05):
+                conn.sendall(b" ")
+        except OSError:
+            pass
+
+
+def in_thread(fn, seconds=10):
+    """fn() in a thread; (finished, result or exception). A hang is a failure,
+    not a test run that never ends."""
+    box = {}
+
+    def target():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["result"] = exc
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(seconds)
+    return not t.is_alive(), box.get("result")
+
+
 POP_STUB = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 log = os.environ["STUB_POP_LOG"]
 keys = ["POP_FROM", "POP_SMTP_HOST", "POP_SMTP_PASSWORD", "RESEND_API_KEY"]
+st, null = os.fstat(0), os.stat(os.devnull)
+stdin_null = (st.st_dev, st.st_ino) == (null.st_dev, null.st_ino)
+if os.environ.get("STUB_POP_SLEEP"):
+    time.sleep(float(os.environ["STUB_POP_SLEEP"]))
 with open(log, "a") as fh:
-    fh.write(json.dumps({"argv": sys.argv[1:], "env": {k: os.environ.get(k) for k in keys}}) + "\n")
+    fh.write(json.dumps({"argv": sys.argv[1:], "env": {k: os.environ.get(k) for k in keys},
+                         "stdin_null": stdin_null}) + "\n")
 if os.environ.get("STUB_POP_FAIL"):
     print("smtp auth failed for password " + os.environ.get("POP_SMTP_PASSWORD", ""), file=sys.stderr)
     sys.exit(1)
@@ -393,6 +473,348 @@ class Settings(Base):
         self.assertEqual(self.cli("set", "cooldown_hours", "soon")[0], 2)
         self.assertEqual(self.cli("set", "colour", "red")[0], 2)
         self.assertEqual(self.cli("set", "email_to", "not-an-address")[0], 2)
+
+
+class Crash(BaseException):
+    """What a killed run looks like from inside: nothing after it runs."""
+
+
+class PopMissing(Base):
+    """Kamino 167: cron's PATH has no pop - check must say so at once."""
+
+    def no_pop(self):
+        empty = os.path.join(self.tmp, "empty-bin")
+        os.makedirs(empty, exist_ok=True)
+        return mock.patch.dict(os.environ, {"EDCMEA_POP": "", "PATH": empty})
+
+    def test_check_exits_2_before_fetching_anything(self):
+        self.ready()
+        self.fake.requests.clear()
+        with self.no_pop():
+            rc, out = self.cli("check")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("pop is not installed, or not on this PATH", out)
+        self.assertIn("EDCMEA_POP", out)
+        self.assertEqual(self.fake.requests, [])
+        self.assertEqual(self.pops(), [])
+
+    def test_an_edcmea_pop_that_is_not_executable_counts_as_missing(self):
+        self.ready()
+        with mock.patch.dict(os.environ, {"EDCMEA_POP": os.path.join(self.tmp, "no-such-pop")}):
+            rc, out = self.cli("check")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("EDCMEA_POP", out)
+
+    def test_a_dry_run_needs_no_pop(self):
+        self.ready()
+        with self.no_pop():
+            rc, out = self.cli("check", "--dry-run")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("[would alert]", out)
+
+
+class Resilience(Base):
+    """Kamino 168: whatever fails after a rule mailed, it is not mailed again."""
+
+    def test_network_failures_are_retried(self):
+        self.ready()
+        for failure in ("drop", "truncate", (503, {})):
+            with self.subTest(failure=failure):
+                self.fake.requests.clear()
+                self.fake.script = [failure]
+                self.assertIsInstance(ardent.commodities(), list)
+                self.assertEqual(len(self.fake.requests), 2)
+
+    def test_a_later_rule_with_null_coordinates_does_not_re_mail_the_first(self):
+        self.ready()
+        self.cli("rules", "add", "near", LTD, "600000", "--near", "Sol", "--max-ly", "100")
+        self.fake.systems["sol"] = {"systemX": None, "systemY": None, "systemZ": None}
+        for _ in range(3):
+            rc, out = self.cli("check")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("[error] near:", out)
+        self.assertEqual(len(self.pops()), 1)
+
+    def test_rows_without_coordinates_are_skipped_not_fatal(self):
+        self.fake.imports[LTD][1].update(systemX=None)
+        rule = rules.validate({"name": "t", "commodity": LTD, "min_price": 600000, "near": "Sol", "max_ly": 1000})
+        names = [r["stationName"] for r in rules.matches(rule, (0.0, 0.0, 0.0))]
+        self.assertNotIn("Arc City", names)
+        self.assertIn("Small Port", names)
+
+    def test_one_rule_raising_anything_does_not_stop_the_others(self):
+        self.ready()
+        self.cli("rules", "add", "other", LTD, "600000", "--pad", "L")
+        real = rules.matches
+
+        def matches(rule, origin=None):
+            if rule["name"] == "ltd":
+                raise TypeError("unsupported operand")
+            return real(rule, origin)
+        with mock.patch.object(rules, "matches", matches):
+            rc, out = self.cli("check")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("[error] ltd: unexpected TypeError", out)
+        self.assertIn("[alert] other:", out)
+
+    def test_state_is_saved_after_each_email(self):
+        self.ready()
+        self.cli("rules", "add", "other", LTD, "600000", "--pad", "L")
+        real, calls = notify.send, []
+
+        def send(*args):
+            calls.append(args)
+            if len(calls) == 2:
+                raise Crash()               # the run dies while sending the second
+            real(*args)
+        with mock.patch.object(notify, "send", send), self.assertRaises(Crash):
+            self.cli("check")
+        self.assertEqual(sorted(config.load_state()), ["ltd"])
+        self.cli("check")
+        subjects = [c["argv"][c["argv"].index("--subject") + 1] for c in self.pops()]
+        self.assertEqual(len(subjects), 2)          # ltd once, other once: nothing twice
+
+    def test_a_state_file_that_is_not_an_object_is_refused_by_name(self):
+        self.ready()
+        for text in ("[]", '"x"', '{"ltd": 5}'):
+            with self.subTest(text=text):
+                os.makedirs(config.state_dir(), exist_ok=True)
+                with open(config.state_file(), "w") as fh:
+                    fh.write(text)
+                self.fake.requests.clear()
+                rc, out = self.cli("check")
+                self.assertEqual(rc, 2, out)
+                self.assertIn(config.state_file(), out)
+                self.assertEqual(self.pops(), [])
+                with open(config.state_file()) as fh:
+                    self.assertEqual(fh.read(), text)        # left as it was, not reset
+
+
+class Flapping(Base):
+    """Kamino 179 (1): only a real improvement alerts before the cooldown."""
+
+    def test_two_stations_trading_the_top_spot_mail_once(self):
+        self.ready()
+        self.fake.imports[LTD].append(row("Rival", 642_000))
+        for run in range(6):
+            self.fake.imports[LTD][1]["sellPrice"] = 642_763 if run % 2 == 0 else 641_000
+            self.fake.imports[LTD][-1]["sellPrice"] = 641_000 if run % 2 == 0 else 643_500
+            self.cli("check")
+        self.assertEqual(len(self.pops()), 1)
+
+    def test_a_worse_station_does_not_alert_when_the_best_drops_out(self):
+        self.ready()
+        self.cli("check")
+        del self.fake.imports[LTD][1]                       # Arc City gone; Small Port is best now
+        rc, out = self.cli("check")
+        self.assertIn("already alerted", out)
+        self.assertEqual(len(self.pops()), 1)
+
+
+class Deadline(Base):
+    """Kamino 179 (2) and the urlopen-timeout survivor."""
+
+    def peer(self, mode):
+        p = RawPeer(mode)
+        self.addCleanup(p.stop.set)
+        return p
+
+    def test_a_slow_drip_peer_cannot_hold_the_run_past_its_deadline(self):
+        self.ready()
+        p = self.peer("drip")
+        self.cli("set", "run_deadline_minutes", "0.01")         # 0.6 s
+        started = time.monotonic()
+        with mock.patch.object(ardent, "API_URL", p.url):
+            finished, result = in_thread(lambda: self.cli("check"))
+        self.assertTrue(finished, "check was still reading the drip after 10 s")
+        rc, out = result
+        self.assertEqual(rc, 1, out)
+        self.assertIn("deadline", out)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_silent_peer_times_out(self):
+        p = self.peer("silent")
+        with mock.patch.object(ardent, "API_URL", p.url), mock.patch.object(ardent, "TIMEOUT", 0.3):
+            finished, result = in_thread(ardent.commodities)
+        self.assertTrue(finished, "no timeout: urlopen waited on a peer that never answers")
+        self.assertIsInstance(result, ardent.ApiError)
+
+    def test_the_lock_names_its_holder_and_a_stuck_one_fails_the_run(self):
+        self.ready()
+        import fcntl
+        self.cli("check")
+        with open(config.lock_file()) as fh:
+            pid, started = fh.read().split()
+        self.assertEqual(int(pid), os.getpid())
+        self.assertLess(abs(time.time() - float(started)), 60)
+        for age, rc_expected, says in ((60, 0, "another check is running (pid 4242"),
+                                       (3 * 3600, 1, "check pid 4242 has held")):
+            with self.subTest(age=age), open(config.lock_file(), "r+") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                held.truncate()
+                held.write(f"4242 {time.time() - age:.0f}\n")
+                held.flush()
+                rc, out = self.cli("check")
+                self.assertEqual(rc, rc_expected, out)
+                self.assertIn(says, out)
+        with open(config.lock_file()) as fh:
+            self.assertIn("4242", fh.read())          # a refused run leaves the holder's line alone
+
+
+class Survivors(Base):
+    """Kamino 179 (4): the mutants the first review saw survive."""
+
+    def test_state_is_written_atomically(self):
+        config.save_state({"a": {"price": 1}})
+        with mock.patch.object(config.os, "replace", side_effect=OSError("disk full")), \
+                self.assertRaises(OSError):
+            config.save_state({"b": {"price": 2}})
+        self.assertEqual(config.load_state(), {"a": {"price": 1}})
+        self.assertEqual([f for f in os.listdir(config.state_dir()) if f.endswith(".tmp")], [])
+
+    def test_a_5xx_is_retried_until_it_answers(self):
+        self.fake.script = [(503, {}), (502, {})]
+        self.assertIsInstance(ardent.commodities(), list)
+        self.assertEqual(len(self.fake.requests), 3)
+
+    def test_a_4xx_is_not_retried(self):
+        self.fake.script = [(400, {})]
+        with self.assertRaises(ardent.ApiError):
+            ardent.commodities()
+        self.assertEqual(len(self.fake.requests), 1)
+
+    def test_a_corrupt_state_is_an_error_never_a_reset(self):
+        self.ready()
+        self.cli("check")
+        for text in ('{"ltd": ', b"\xff\xfe\x00garbage"):
+            with self.subTest(text=text):
+                with open(config.state_file(), "wb") as fh:
+                    fh.write(text if isinstance(text, bytes) else text.encode())
+                self.fake.requests.clear()
+                rc, out = self.cli("check")
+                self.assertEqual(rc, 2, out)
+                self.assertIn(config.state_file(), out)          # Kamino 197: named
+                self.assertEqual(len(self.pops()), 1)
+                self.assertEqual(self.fake.requests, [])
+
+    def test_pop_reads_nothing_from_our_stdin(self):
+        self.ready()
+        r, w = os.pipe()
+        saved = os.dup(0)
+        try:
+            os.dup2(r, 0)
+            notify.send("s", "b", "cmdr@example.com")
+        finally:
+            os.dup2(saved, 0)
+            for fd in (saved, r, w):
+                os.close(fd)
+        self.assertTrue(self.pops()[0]["stdin_null"])
+
+    def test_a_hung_pop_is_given_up_on(self):
+        self.ready()
+        with mock.patch.dict(os.environ, {"STUB_POP_SLEEP": "5"}), \
+                mock.patch.object(notify, "POP_TIMEOUT", 0.5):
+            finished, result = in_thread(lambda: notify.send("s", "b", "cmdr@example.com"), seconds=4)
+        self.assertTrue(finished, "pop was waited for past its timeout")
+        self.assertIsInstance(result, notify.NotifyError)
+        self.assertIn("did not finish", str(result))
+
+    def test_pop_env_wins_over_the_environment(self):
+        self.ready()
+        with mock.patch.dict(os.environ, {"POP_FROM": "env@example.com"}):
+            notify.send("s", "b", "cmdr@example.com")
+        self.assertEqual(self.pops()[0]["env"]["POP_FROM"], "alerts@example.com")
+
+
+class Edges(Base):
+    """Kamino 197."""
+
+    def test_a_pop_env_others_can_read_is_refused(self):
+        self.ready()
+        os.chmod(config.pop_env_file(), 0o644)
+        self.fake.requests.clear()
+        rc, out = self.cli("check")
+        self.assertEqual(rc, 2, out)
+        self.assertIn(config.pop_env_file(), out)
+        self.assertIn("chmod 600", out)
+        self.assertEqual(self.fake.requests, [])
+        rc, out = self.cli("notify-test")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.pops(), [])
+        rc, out = self.cli("config")                    # the rest still shows
+        self.assertEqual(rc, 0, out)
+        self.assertIn("pop_env=refused", out)
+
+    def test_a_pop_env_of_another_user_is_refused(self):
+        self.ready()
+        with mock.patch.object(os, "getuid", return_value=os.getuid() + 1), \
+                self.assertRaisesRegex(ValueError, "belongs to another user"):
+            config.load_pop_env()
+
+    def test_pop_env_values_keep_their_spaces(self):
+        config.write_private(config.pop_env_file(), "POP_SMTP_PASSWORD=  pw with spaces \nPOP_FROM=a@b.c\r\n")
+        self.assertEqual(config.load_pop_env(), {"POP_SMTP_PASSWORD": "  pw with spaces ", "POP_FROM": "a@b.c"})
+
+    def test_nan_and_inf_are_not_numbers_here(self):
+        for key in ("max_ly", "max_age_days", "max_arrival_ls"):
+            for bad in ("nan", "inf", "-inf"):
+                rule = {"name": "x", "commodity": LTD, "min_price": 1, key: bad}
+                if key == "max_ly":
+                    rule["near"] = "Sol"
+                with self.subTest(key=key, bad=bad), self.assertRaisesRegex(ValueError, key):
+                    rules.validate(rule)
+        rc, out = self.cli("rules", "add", "ltd", LTD, "1", "--near", "Sol", "--max-ly", "nan")
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(self.cli("set", "cooldown_hours", "nan")[0], 2)
+
+    def test_quiet_prints_only_alerts_and_errors(self):
+        self.ready()
+        rc, out = self.cli("check", "--quiet")
+        self.assertIn("[alert] ltd:", out)
+        rc, out = self.cli("check", "--quiet")
+        self.assertEqual((rc, out), (0, ""))
+        self.fake.down = True
+        rc, out = self.cli("check", "--quiet")
+        self.assertIn("[error] ltd:", out)
+
+    def test_a_429_is_retried_after_retry_after(self):
+        waits = []
+        with mock.patch.object(ardent.time, "sleep", waits.append):
+            self.fake.script = [(429, {"Retry-After": "7"})]
+            self.assertIsInstance(ardent.commodities(), list)
+            self.fake.script = [(429, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})]   # past: the backoff
+            self.assertIsInstance(ardent.commodities(), list)
+            self.fake.script = [(429, {"Retry-After": "86400"})]                           # capped
+            self.assertIsInstance(ardent.commodities(), list)
+        self.assertEqual(waits, [7.0, 1, ardent.RETRY_AFTER_MAX])
+
+    def test_a_slash_in_a_name_stays_in_its_path_segment(self):
+        ardent.system("Col 285 Sector AB/CD")
+        self.assertTrue(self.fake.requests[-1][0].endswith("/system/name/Col%20285%20Sector%20AB%2FCD"),
+                        self.fake.requests[-1][0])
+
+    def test_sigterm_between_sending_and_saving_sends_once(self):
+        self.ready()
+        self.cli("rules", "add", "other", LTD, "600000", "--pad", "L")
+        real = notify.send
+
+        def die(*_):
+            raise Crash()       # what SIGTERM's default does, in a form a test survives
+        old = signal.signal(signal.SIGTERM, die)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+
+        def send(*args):
+            real(*args)
+            os.kill(os.getpid(), signal.SIGTERM)    # after pop, before the save
+        with mock.patch.object(notify, "send", send):
+            rc, out = self.cli("check")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stopped by SIGTERM", out)
+        self.assertEqual(sorted(config.load_state()), ["ltd"])
+        self.assertNotIn("other", out)                      # stopped before the next rule
+        self.assertIs(signal.getsignal(signal.SIGTERM), die)   # its own handler restored
+        self.cli("check")
+        self.assertEqual(len(self.pops()), 2)               # ltd once, then other
 
 
 class Launcher(unittest.TestCase):

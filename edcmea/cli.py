@@ -4,7 +4,7 @@ Watches Elite Dangerous commodity markets (Ardent Insight's data, from EDDN)
 and emails, through Charm's pop, when a station pays what a rule asks.
 
 Commands:
-  check [--dry-run] [--rule NAME]   run every rule once; email what is new (for cron)
+  check [--dry-run] [--rule NAME] [--quiet]   run every rule once; email what is new (for cron)
   rules list                        the watch rules
   rules add NAME COMMODITY MIN_PRICE [filters]   add or replace a rule
   rules remove NAME                 delete a rule
@@ -17,7 +17,8 @@ Commands:
   pop-env --list                    which pop settings are set (names only)
   notify-test                       send one test email
 
-Exit codes: 0 ok; 1 a rule or the email failed; 2 bad configuration or usage.
+Exit codes: 0 ok; 1 a rule or the email failed; 2 bad configuration or usage
+(pop not found included: `check` says so before fetching anything).
 
 Every rule is checked against Ardent before it is saved: an unknown commodity
 there is an empty market, not an error, so a typo would never alert.
@@ -118,11 +119,15 @@ def cmd_set(args) -> int:
 
 def cmd_config(_args) -> int:
     cfg = config.load()
-    pop_env = config.load_pop_env()
+    try:
+        pop_env = config.load_pop_env()
+        pop_env_set = ",".join(k for k in config.POP_KEYS if k in pop_env) or "none"
+    except ValueError as exc:            # a pop.env it refuses: the rest still shows
+        pop_env_set = f"refused - {exc}"
     lines = {"config_file": config.config_file(), "pop_env_file": config.pop_env_file(),
              "state_file": config.state_file(), "rules": len(cfg["rules"]),
              "pop": notify.pop_binary() or "missing",
-             "pop_env": ",".join(k for k in config.POP_KEYS if k in pop_env) or "none",
+             "pop_env": pop_env_set,
              "api_url": ardent.API_URL}
     lines.update(cfg["settings"])
     for key, value in lines.items():
@@ -175,6 +180,8 @@ def parser() -> argparse.ArgumentParser:
     c = sub.add_parser("check", help="run every rule once; email what is new")
     c.add_argument("--dry-run", action="store_true", help="show what would be sent; send and record nothing")
     c.add_argument("--rule", help="only this rule")
+    c.add_argument("--quiet", action="store_true",
+                   help="print only alerts and errors (for a cron log: it grows by what happened)")
 
     r = sub.add_parser("rules", help="list, add or remove watch rules")
     rs = r.add_subparsers(dest="action", required=True)
@@ -212,7 +219,7 @@ def main(argv=None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "check":
-            return check.run(dry_run=args.dry_run, only=args.rule)
+            return check.run(dry_run=args.dry_run, only=args.rule, quiet=args.quiet)
         return {"rules": cmd_rules, "commodities": cmd_commodities, "status": cmd_status,
                 "set": cmd_set, "config": cmd_config, "pop-env": cmd_pop_env,
                 "notify-test": cmd_notify_test}[args.command](args)
