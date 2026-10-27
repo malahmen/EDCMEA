@@ -7,7 +7,7 @@ A command-line tool made to run from cron: each `edcmea check` looks at every
 watch rule once, emails what is new, and exits. Market data comes from
 [Ardent Insight](https://ardent-insight.com)'s public API (the EDDN feed, no
 key needed); mail goes out through Charm's [pop](https://github.com/charmbracelet/pop),
-over Resend or any SMTP server. Python 3.9+, standard library only.
+over Resend or any SMTP server. Python 3.10+, standard library only.
 
 > v2 is a rewrite. v1 (tag `v1.0.0`) was a Node script scraping eddb.io, which
 > closed in April 2023.

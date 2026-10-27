@@ -15,11 +15,16 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 3.10 is the oldest it supports (and the oldest setup-python has for
+        # ubuntu-latest, now 26.04); 3.x is the newest stable.
+        python: ["3.10", "3.x"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.9"     # the oldest it supports; the code is checked against it
+          python-version: ${{ matrix.python }}
       - name: compile
         run: python -m compileall -q edcmea edcmea.py
       - name: shellcheck
