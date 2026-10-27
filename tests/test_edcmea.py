@@ -7,6 +7,8 @@ import contextlib
 import io
 import json
 import os
+import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -50,6 +52,10 @@ class FakeArdent:
         self.down = False
         self.server_filters = True     # False: Ardent stops honouring its filters
         self.requests = []
+        # What the next requests get instead of an answer, one each:
+        # (code, headers) an HTTP error; "truncate" the first bytes of a
+        # longer body (they parse: "[]"), then the connection closes; "drop" the connection closes with no answer.
+        self.script = []
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -57,6 +63,20 @@ class FakeArdent:
                 url = urlparse(self.path)
                 q = {k: v[0] for k, v in parse_qs(url.query).items()}
                 fake.requests.append((url.path, q))
+                if fake.script:
+                    action = fake.script.pop(0)
+                    if action == "drop":
+                        self.close_connection = True
+                        return None
+                    if action == "truncate":
+                        self.send_response(200)
+                        self.send_header("Content-Length", "1000")
+                        self.end_headers()
+                        self.wfile.write(b"[]")    # valid JSON, yet only part of the answer
+                        self.close_connection = True
+                        return None
+                    code, headers = action
+                    return self.reply(code, {"error": "scripted"}, headers)
                 if fake.down:
                     return self.reply(503, {"error": "down"})
                 parts = url.path.strip("/").split("/")
@@ -78,9 +98,11 @@ class FakeArdent:
                     return self.reply(200, rows)
                 return self.reply(404, {"error": "no route"})
 
-            def reply(self, code, data):
+            def reply(self, code, data, headers=None):
                 body = json.dumps(data).encode()
                 self.send_response(code)
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -94,12 +116,70 @@ class FakeArdent:
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v2"
 
 
+class RawPeer:
+    """A peer that is not an HTTP server: "silent" accepts and never answers;
+    "drip" sends headers for a long body, then a byte every 50 ms."""
+
+    def __init__(self, mode):
+        self.mode, self.stop = mode, threading.Event()
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.sock.settimeout(0.1)
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}/v2"
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        conns = []
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                continue
+            conns.append(conn)
+            if self.mode == "drip":
+                threading.Thread(target=self.drip, args=(conn,), daemon=True).start()
+        for conn in conns:
+            conn.close()
+        self.sock.close()
+
+    def drip(self, conn):
+        try:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n[")
+            while not self.stop.wait(0.05):
+                conn.sendall(b" ")
+        except OSError:
+            pass
+
+
+def in_thread(fn, seconds=10):
+    """fn() in a thread; (finished, result or exception). A hang is a failure,
+    not a test run that never ends."""
+    box = {}
+
+    def target():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["result"] = exc
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(seconds)
+    return not t.is_alive(), box.get("result")
+
+
 POP_STUB = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
 log = os.environ["STUB_POP_LOG"]
 keys = ["POP_FROM", "POP_SMTP_HOST", "POP_SMTP_PASSWORD", "RESEND_API_KEY"]
+st, null = os.fstat(0), os.stat(os.devnull)
+stdin_null = (st.st_dev, st.st_ino) == (null.st_dev, null.st_ino)
+if os.environ.get("STUB_POP_SLEEP"):
+    time.sleep(float(os.environ["STUB_POP_SLEEP"]))
 with open(log, "a") as fh:
-    fh.write(json.dumps({"argv": sys.argv[1:], "env": {k: os.environ.get(k) for k in keys}}) + "\n")
+    fh.write(json.dumps({"argv": sys.argv[1:], "env": {k: os.environ.get(k) for k in keys},
+                         "stdin_null": stdin_null}) + "\n")
 if os.environ.get("STUB_POP_FAIL"):
     print("smtp auth failed for password " + os.environ.get("POP_SMTP_PASSWORD", ""), file=sys.stderr)
     sys.exit(1)
@@ -393,6 +473,74 @@ class Settings(Base):
         self.assertEqual(self.cli("set", "cooldown_hours", "soon")[0], 2)
         self.assertEqual(self.cli("set", "colour", "red")[0], 2)
         self.assertEqual(self.cli("set", "email_to", "not-an-address")[0], 2)
+
+
+class Crash(BaseException):
+    """What a killed run looks like from inside: nothing after it runs."""
+
+
+class Resilience(Base):
+    """Kamino 168: whatever fails after a rule mailed, it is not mailed again."""
+
+    def test_network_failures_are_retried(self):
+        self.ready()
+        for failure in ("drop", "truncate", (503, {})):
+            with self.subTest(failure=failure):
+                self.fake.requests.clear()
+                self.fake.script = [failure]
+                self.assertIsInstance(ardent.commodities(), list)
+                self.assertEqual(len(self.fake.requests), 2)
+
+
+class Deadline(Base):
+    """Kamino 179 (2) and the urlopen-timeout survivor."""
+
+    def peer(self, mode):
+        p = RawPeer(mode)
+        self.addCleanup(p.stop.set)
+        return p
+
+    def test_a_silent_peer_times_out(self):
+        p = self.peer("silent")
+        with mock.patch.object(ardent, "API_URL", p.url), mock.patch.object(ardent, "TIMEOUT", 0.3):
+            finished, result = in_thread(ardent.commodities)
+        self.assertTrue(finished, "no timeout: urlopen waited on a peer that never answers")
+        self.assertIsInstance(result, ardent.ApiError)
+
+
+class Survivors(Base):
+    """Kamino 179 (4): the mutants the first review saw survive."""
+
+    def test_a_5xx_is_retried_until_it_answers(self):
+        self.fake.script = [(503, {}), (502, {})]
+        self.assertIsInstance(ardent.commodities(), list)
+        self.assertEqual(len(self.fake.requests), 3)
+
+    def test_a_4xx_is_not_retried(self):
+        self.fake.script = [(400, {})]
+        with self.assertRaises(ardent.ApiError):
+            ardent.commodities()
+        self.assertEqual(len(self.fake.requests), 1)
+
+
+class Edges(Base):
+    """Kamino 197."""
+
+    def test_a_429_is_retried_after_retry_after(self):
+        waits = []
+        with mock.patch.object(ardent.time, "sleep", waits.append):
+            self.fake.script = [(429, {"Retry-After": "7"})]
+            self.assertIsInstance(ardent.commodities(), list)
+            self.fake.script = [(429, {"Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"})]   # past: the backoff
+            self.assertIsInstance(ardent.commodities(), list)
+            self.fake.script = [(429, {"Retry-After": "86400"})]                           # capped
+            self.assertIsInstance(ardent.commodities(), list)
+        self.assertEqual(waits, [7.0, 1, ardent.RETRY_AFTER_MAX])
+
+    def test_a_slash_in_a_name_stays_in_its_path_segment(self):
+        ardent.system("Col 285 Sector AB/CD")
+        self.assertTrue(self.fake.requests[-1][0].endswith("/system/name/Col%20285%20Sector%20AB%2FCD"),
+                        self.fake.requests[-1][0])
 
 
 class Launcher(unittest.TestCase):
