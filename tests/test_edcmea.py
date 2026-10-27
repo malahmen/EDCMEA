@@ -479,6 +479,40 @@ class Crash(BaseException):
     """What a killed run looks like from inside: nothing after it runs."""
 
 
+class PopMissing(Base):
+    """Kamino 167: cron's PATH has no pop - check must say so at once."""
+
+    def no_pop(self):
+        empty = os.path.join(self.tmp, "empty-bin")
+        os.makedirs(empty, exist_ok=True)
+        return mock.patch.dict(os.environ, {"EDCMEA_POP": "", "PATH": empty})
+
+    def test_check_exits_2_before_fetching_anything(self):
+        self.ready()
+        self.fake.requests.clear()
+        with self.no_pop():
+            rc, out = self.cli("check")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("pop is not installed, or not on this PATH", out)
+        self.assertIn("EDCMEA_POP", out)
+        self.assertEqual(self.fake.requests, [])
+        self.assertEqual(self.pops(), [])
+
+    def test_an_edcmea_pop_that_is_not_executable_counts_as_missing(self):
+        self.ready()
+        with mock.patch.dict(os.environ, {"EDCMEA_POP": os.path.join(self.tmp, "no-such-pop")}):
+            rc, out = self.cli("check")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("EDCMEA_POP", out)
+
+    def test_a_dry_run_needs_no_pop(self):
+        self.ready()
+        with self.no_pop():
+            rc, out = self.cli("check", "--dry-run")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("[would alert]", out)
+
+
 class Resilience(Base):
     """Kamino 168: whatever fails after a rule mailed, it is not mailed again."""
 
@@ -491,12 +525,54 @@ class Resilience(Base):
                 self.assertIsInstance(ardent.commodities(), list)
                 self.assertEqual(len(self.fake.requests), 2)
 
+    def test_a_later_rule_with_null_coordinates_does_not_re_mail_the_first(self):
+        self.ready()
+        self.cli("rules", "add", "near", LTD, "600000", "--near", "Sol", "--max-ly", "100")
+        self.fake.systems["sol"] = {"systemX": None, "systemY": None, "systemZ": None}
+        for _ in range(3):
+            rc, out = self.cli("check")
+            self.assertEqual(rc, 1, out)
+            self.assertIn("[error] near:", out)
+        self.assertEqual(len(self.pops()), 1)
+
     def test_rows_without_coordinates_are_skipped_not_fatal(self):
         self.fake.imports[LTD][1].update(systemX=None)
         rule = rules.validate({"name": "t", "commodity": LTD, "min_price": 600000, "near": "Sol", "max_ly": 1000})
         names = [r["stationName"] for r in rules.matches(rule, (0.0, 0.0, 0.0))]
         self.assertNotIn("Arc City", names)
         self.assertIn("Small Port", names)
+
+    def test_one_rule_raising_anything_does_not_stop_the_others(self):
+        self.ready()
+        self.cli("rules", "add", "other", LTD, "600000", "--pad", "L")
+        real = rules.matches
+
+        def matches(rule, origin=None):
+            if rule["name"] == "ltd":
+                raise TypeError("unsupported operand")
+            return real(rule, origin)
+        with mock.patch.object(rules, "matches", matches):
+            rc, out = self.cli("check")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("[error] ltd: unexpected TypeError", out)
+        self.assertIn("[alert] other:", out)
+
+    def test_state_is_saved_after_each_email(self):
+        self.ready()
+        self.cli("rules", "add", "other", LTD, "600000", "--pad", "L")
+        real, calls = notify.send, []
+
+        def send(*args):
+            calls.append(args)
+            if len(calls) == 2:
+                raise Crash()               # the run dies while sending the second
+            real(*args)
+        with mock.patch.object(notify, "send", send), self.assertRaises(Crash):
+            self.cli("check")
+        self.assertEqual(sorted(config.load_state()), ["ltd"])
+        self.cli("check")
+        subjects = [c["argv"][c["argv"].index("--subject") + 1] for c in self.pops()]
+        self.assertEqual(len(subjects), 2)          # ltd once, other once: nothing twice
 
     def test_a_state_file_that_is_not_an_object_is_refused_by_name(self):
         self.ready()
@@ -514,6 +590,27 @@ class Resilience(Base):
                     self.assertEqual(fh.read(), text)        # left as it was, not reset
 
 
+class Flapping(Base):
+    """Kamino 179 (1): only a real improvement alerts before the cooldown."""
+
+    def test_two_stations_trading_the_top_spot_mail_once(self):
+        self.ready()
+        self.fake.imports[LTD].append(row("Rival", 642_000))
+        for run in range(6):
+            self.fake.imports[LTD][1]["sellPrice"] = 642_763 if run % 2 == 0 else 641_000
+            self.fake.imports[LTD][-1]["sellPrice"] = 641_000 if run % 2 == 0 else 643_500
+            self.cli("check")
+        self.assertEqual(len(self.pops()), 1)
+
+    def test_a_worse_station_does_not_alert_when_the_best_drops_out(self):
+        self.ready()
+        self.cli("check")
+        del self.fake.imports[LTD][1]                       # Arc City gone; Small Port is best now
+        rc, out = self.cli("check")
+        self.assertIn("already alerted", out)
+        self.assertEqual(len(self.pops()), 1)
+
+
 class Deadline(Base):
     """Kamino 179 (2) and the urlopen-timeout survivor."""
 
@@ -522,12 +619,46 @@ class Deadline(Base):
         self.addCleanup(p.stop.set)
         return p
 
+    def test_a_slow_drip_peer_cannot_hold_the_run_past_its_deadline(self):
+        self.ready()
+        p = self.peer("drip")
+        self.cli("set", "run_deadline_minutes", "0.01")         # 0.6 s
+        started = time.monotonic()
+        with mock.patch.object(ardent, "API_URL", p.url):
+            finished, result = in_thread(lambda: self.cli("check"))
+        self.assertTrue(finished, "check was still reading the drip after 10 s")
+        rc, out = result
+        self.assertEqual(rc, 1, out)
+        self.assertIn("deadline", out)
+        self.assertLess(time.monotonic() - started, 5)
+
     def test_a_silent_peer_times_out(self):
         p = self.peer("silent")
         with mock.patch.object(ardent, "API_URL", p.url), mock.patch.object(ardent, "TIMEOUT", 0.3):
             finished, result = in_thread(ardent.commodities)
         self.assertTrue(finished, "no timeout: urlopen waited on a peer that never answers")
         self.assertIsInstance(result, ardent.ApiError)
+
+    def test_the_lock_names_its_holder_and_a_stuck_one_fails_the_run(self):
+        self.ready()
+        import fcntl
+        self.cli("check")
+        with open(config.lock_file()) as fh:
+            pid, started = fh.read().split()
+        self.assertEqual(int(pid), os.getpid())
+        self.assertLess(abs(time.time() - float(started)), 60)
+        for age, rc_expected, says in ((60, 0, "another check is running (pid 4242"),
+                                       (3 * 3600, 1, "check pid 4242 has held")):
+            with self.subTest(age=age), open(config.lock_file(), "r+") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                held.truncate()
+                held.write(f"4242 {time.time() - age:.0f}\n")
+                held.flush()
+                rc, out = self.cli("check")
+                self.assertEqual(rc, rc_expected, out)
+                self.assertIn(says, out)
+        with open(config.lock_file()) as fh:
+            self.assertIn("4242", fh.read())          # a refused run leaves the holder's line alone
 
 
 class Survivors(Base):
@@ -598,6 +729,22 @@ class Survivors(Base):
 class Edges(Base):
     """Kamino 197."""
 
+    def test_a_pop_env_others_can_read_is_refused(self):
+        self.ready()
+        os.chmod(config.pop_env_file(), 0o644)
+        self.fake.requests.clear()
+        rc, out = self.cli("check")
+        self.assertEqual(rc, 2, out)
+        self.assertIn(config.pop_env_file(), out)
+        self.assertIn("chmod 600", out)
+        self.assertEqual(self.fake.requests, [])
+        rc, out = self.cli("notify-test")
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.pops(), [])
+        rc, out = self.cli("config")                    # the rest still shows
+        self.assertEqual(rc, 0, out)
+        self.assertIn("pop_env=refused", out)
+
     def test_a_pop_env_of_another_user_is_refused(self):
         self.ready()
         with mock.patch.object(os, "getuid", return_value=os.getuid() + 1), \
@@ -620,6 +767,16 @@ class Edges(Base):
         self.assertEqual(rc, 2, out)
         self.assertEqual(self.cli("set", "cooldown_hours", "nan")[0], 2)
 
+    def test_quiet_prints_only_alerts_and_errors(self):
+        self.ready()
+        rc, out = self.cli("check", "--quiet")
+        self.assertIn("[alert] ltd:", out)
+        rc, out = self.cli("check", "--quiet")
+        self.assertEqual((rc, out), (0, ""))
+        self.fake.down = True
+        rc, out = self.cli("check", "--quiet")
+        self.assertIn("[error] ltd:", out)
+
     def test_a_429_is_retried_after_retry_after(self):
         waits = []
         with mock.patch.object(ardent.time, "sleep", waits.append):
@@ -635,6 +792,29 @@ class Edges(Base):
         ardent.system("Col 285 Sector AB/CD")
         self.assertTrue(self.fake.requests[-1][0].endswith("/system/name/Col%20285%20Sector%20AB%2FCD"),
                         self.fake.requests[-1][0])
+
+    def test_sigterm_between_sending_and_saving_sends_once(self):
+        self.ready()
+        self.cli("rules", "add", "other", LTD, "600000", "--pad", "L")
+        real = notify.send
+
+        def die(*_):
+            raise Crash()       # what SIGTERM's default does, in a form a test survives
+        old = signal.signal(signal.SIGTERM, die)
+        self.addCleanup(signal.signal, signal.SIGTERM, old)
+
+        def send(*args):
+            real(*args)
+            os.kill(os.getpid(), signal.SIGTERM)    # after pop, before the save
+        with mock.patch.object(notify, "send", send):
+            rc, out = self.cli("check")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("stopped by SIGTERM", out)
+        self.assertEqual(sorted(config.load_state()), ["ltd"])
+        self.assertNotIn("other", out)                      # stopped before the next rule
+        self.assertIs(signal.getsignal(signal.SIGTERM), die)   # its own handler restored
+        self.cli("check")
+        self.assertEqual(len(self.pops()), 2)               # ltd once, then other
 
 
 class Launcher(unittest.TestCase):
